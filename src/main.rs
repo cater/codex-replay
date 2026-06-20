@@ -10,7 +10,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarState},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarState, Wrap},
     Frame, Terminal,
 };
 use crossterm::{
@@ -218,6 +218,7 @@ fn ui(f: &mut Frame, app: &mut App) {
                 .title(conv_title)
                 .border_style(conv_border_style),
         )
+        .wrap(Wrap { trim: false })
         .scroll((app.scroll_offset as u16, 0));
     f.render_widget(paragraph, right_chunks[0]);
 

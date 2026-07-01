@@ -4,16 +4,6 @@ use ratatui::{
     text::{Line, Span, Text},
 };
 
-/// 判断一条消息是否为系统注入内容（权限指令、协作模式、技能列表、AGENTS.md 等）
-fn is_system_message(content: &str) -> bool {
-    content.contains("<INSTRUCTIONS>")
-        || content.contains("<environment_context>")
-        || content.contains("<permissions instructions>")
-        || content.contains("<collaboration_mode>")
-        || content.contains("<skills_instructions>")
-        || content.starts_with("# AGENTS.md instructions for")
-}
-
 #[derive(Default)]
 pub struct Conversation {
     pub messages: Vec<Message>,
@@ -32,7 +22,7 @@ impl Conversation {
     pub fn first_user_prompt(&self) -> Option<&str> {
         self.messages
             .iter()
-            .find(|m| m.role == "user" && !is_system_message(&m.content))
+            .find(|m| m.role == "user" && !crate::parser::is_system_message(&m.content))
             .map(|m| m.content.as_str())
     }
 
@@ -42,7 +32,9 @@ impl Conversation {
 
         for msg in &self.messages {
             // 跳过系统注入消息
-            if (msg.role == "user" || msg.role == "developer") && is_system_message(&msg.content) {
+            if (msg.role == "user" || msg.role == "developer")
+                && crate::parser::is_system_message(&msg.content)
+            {
                 continue;
             }
 

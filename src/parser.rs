@@ -13,6 +13,16 @@ pub struct Message {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
+/// 判断一条消息是否为系统注入内容（权限指令、协作模式、技能列表、AGENTS.md 等）
+pub fn is_system_message(content: &str) -> bool {
+    content.contains("<INSTRUCTIONS>")
+        || content.contains("<environment_context>")
+        || content.contains("<permissions instructions>")
+        || content.contains("<collaboration_mode>")
+        || content.contains("<skills_instructions>")
+        || content.starts_with("# AGENTS.md instructions")
+}
+
 /// 解析 .jsonl 文件，自动识别格式并提取所有对话消息
 ///
 /// 支持两种格式：
@@ -56,6 +66,57 @@ pub fn parse_jsonl_file(path: &Path) -> Result<Vec<Message>> {
         }
     }
     Ok(messages)
+}
+
+/// 提取会话标题。
+///
+/// 优先级：
+/// 1. Claude/Codex 日志中的 `ai-title`
+/// 2. 第一条真实用户消息
+pub fn extract_session_title(path: &Path) -> Result<Option<String>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut first_user_prompt: Option<String> = None;
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let obj: Value = match serde_json::from_str(&line) {
+            Ok(obj) => obj,
+            Err(_) => continue,
+        };
+
+        match obj.get("type").and_then(|v| v.as_str()) {
+            Some("ai-title") => {
+                if let Some(title) = obj.get("aiTitle").and_then(|v| v.as_str()) {
+                    let title = title.trim();
+                    if !title.is_empty() {
+                        return Ok(Some(title.to_string()));
+                    }
+                }
+            }
+            Some("user") if first_user_prompt.is_none() => {
+                if let Some(msg) = parse_claude_user_message(&obj) {
+                    if !is_system_message(&msg.content) {
+                        first_user_prompt = Some(first_line(&msg.content));
+                    }
+                }
+            }
+            Some("response_item") if first_user_prompt.is_none() => {
+                if let Some(msg) = parse_codex_message(&obj) {
+                    if msg.role == "user" && !is_system_message(&msg.content) {
+                        first_user_prompt = Some(first_line(&msg.content));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(first_user_prompt.filter(|s| !s.is_empty()))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -287,6 +348,14 @@ fn extract_timestamp(obj: &Value) -> Option<DateTime<Utc>> {
         .map(|dt| dt.with_timezone(&Utc))
 }
 
+fn first_line(s: &str) -> String {
+    s.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
 // ── tests ─────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -441,5 +510,42 @@ mod tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert_eq!(msgs[0].content, "File content here");
+    }
+
+    #[test]
+    fn test_extract_session_title_prefers_ai_title() {
+        let jsonl = r#"
+{"type":"user","message":{"role":"user","content":"real prompt"},"isMeta":false}
+{"type":"ai-title","aiTitle":"Add directory navigation to file browser"}
+"#;
+        let path = temp_jsonl("title_ai_title", jsonl);
+        let title = extract_session_title(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title.as_deref(), Some("Add directory navigation to file browser"));
+    }
+
+    #[test]
+    fn test_extract_session_title_falls_back_to_first_user_prompt() {
+        let jsonl = r#"
+{"type":"user","message":{"role":"user","content":"first prompt\nsecond line"},"isMeta":false}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+"#;
+        let path = temp_jsonl("title_first_prompt", jsonl);
+        let title = extract_session_title(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title.as_deref(), Some("first prompt"));
+    }
+
+    #[test]
+    fn test_extract_session_title_skips_agents_instructions() {
+        let jsonl = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"# AGENTS.md instructions\\n\\n<INSTRUCTIONS>\\n系统提示词\\n</INSTRUCTIONS>\"},\"isMeta\":false}\n\
+{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"真正的标题\"},\"isMeta\":false}";
+        let path = temp_jsonl("title_skip_agents", jsonl);
+        let title = extract_session_title(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title.as_deref(), Some("真正的标题"));
     }
 }

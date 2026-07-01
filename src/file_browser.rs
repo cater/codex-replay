@@ -14,10 +14,17 @@ impl Entry {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct FileItem {
+    pub path: PathBuf,
+    pub title: String,
+}
+
 pub struct FileBrowser {
     pub entries: Vec<Entry>,
     pub selected: usize,
     pub current_dir: PathBuf,
+    pub file_titles: Vec<FileItem>,
 }
 
 impl FileBrowser {
@@ -27,6 +34,7 @@ impl FileBrowser {
             entries: Vec::new(),
             selected: 0,
             current_dir,
+            file_titles: Vec::new(),
         };
         fb.refresh();
         fb
@@ -35,6 +43,7 @@ impl FileBrowser {
     /// Rescan the current directory and rebuild the entries list.
     fn refresh(&mut self) {
         self.entries.clear();
+        self.file_titles.clear();
 
         // ".." entry — shown only when current_dir has a parent
         if self.current_dir.parent().is_some() {
@@ -73,6 +82,20 @@ impl FileBrowser {
             self.entries.push(Entry::Directory(d));
         }
         for f in files {
+            let title = crate::parser::extract_session_title(&f)
+                .ok()
+                .flatten()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    f.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                });
+            self.file_titles.push(FileItem {
+                path: f.clone(),
+                title,
+            });
             self.entries.push(Entry::File(f));
         }
 
@@ -93,6 +116,13 @@ impl FileBrowser {
 
     pub fn is_selected_dir(&self) -> bool {
         self.selected_entry().map_or(false, |e| e.is_dir())
+    }
+
+    pub fn file_title(&self, path: &PathBuf) -> Option<&str> {
+        self.file_titles
+            .iter()
+            .find(|item| &item.path == path)
+            .map(|item| item.title.as_str())
     }
 
     /// Enter the currently selected directory. Returns true on success.

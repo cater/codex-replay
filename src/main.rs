@@ -159,8 +159,17 @@ fn ui(f: &mut Frame, app: &mut App) {
                         ListItem::new(format!("📁 {}/", name))
                     }
                     Entry::File(p) => {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy();
-                        ListItem::new(format!("📄 {}", name))
+                        let title = app
+                            .files
+                            .file_title(p)
+                            .map(|s| truncate_str(s, 50))
+                            .unwrap_or_else(|| {
+                                p.file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .to_string()
+                            });
+                        ListItem::new(format!("📄 {}", title))
                     }
                 }
             })

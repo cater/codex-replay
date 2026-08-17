@@ -11,6 +11,7 @@ Built with Rust + [ratatui](https://github.com/ratatui-org/ratatui).
 - **Focus indicator** — focused panel gets a cyan border; unfocused panel dims to dark gray
 - **Scrollbar** — vertical scrollbar with arrow indicators for long conversations
 - **Dynamic title** — conversation panel title shows the first real user prompt (truncated at 60 chars)
+- **Global history search** — search titles and conversation content under `~/.codex` and `~/.claude`
 - **Keyboard-driven** — vi-style keys + arrows, no mouse needed
 
 ## Installation
@@ -43,12 +44,20 @@ If no directory is given, it checks the current directory for `.codex`, then fal
 
 | Key | Action |
 |---|---|
+| `/` | Search Codex and Claude history |
 | `Tab` / `←` / `→` | Switch focus between left and right panels |
 | `↑` / `↓` / `j` / `k` | Navigate file list (left) or scroll conversation (right) |
 | `Enter` | Open directory or load selected `.jsonl` file |
 | `Backspace` | Go to parent directory |
+| `Esc` | Close search and return to file browsing |
 | `PgUp` / `PgDn` | Page up/down (10 lines in file list, 10 lines in conversation) |
 | `q` | Quit |
+
+### Search
+
+Press `/`, enter a keyword, then press `Enter`. Search recursively scans `.jsonl` files in the current Windows user's `~/.codex` and `~/.claude` directories. Matching is case-insensitive and includes session titles and visible conversation messages; injected system instructions are excluded. Select a result with `↑` / `↓` and press `Enter` to open it.
+
+Search runs in the background so the terminal UI remains responsive. A directory passed on the command line changes the normal file browser root, but does not change the two global search roots.
 
 ## UI Layout
 
@@ -97,7 +106,8 @@ src/
 ├── app.rs           # App state, focus management, scroll logic
 ├── file_browser.rs  # File list navigation and directory traversal
 ├── conversation.rs  # Message rendering with color, system message filter
-└── parser.rs        # JSONL parsing
+├── parser.rs        # JSONL parsing
+└── search.rs        # Recursive Codex/Claude history search
 ```
 
 ## Dependencies

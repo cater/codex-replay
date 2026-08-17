@@ -1,10 +1,17 @@
 mod app;
-mod file_browser;
 mod conversation;
+mod file_browser;
 mod parser;
+mod search;
 
 use app::App;
 use app::Focus;
+use app::SearchMode;
+use crossterm::{
+    event::{self, KeyCode, KeyEventKind},
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    ExecutableCommand,
+};
 use file_browser::Entry;
 use ratatui::{
     backend::CrosstermBackend,
@@ -13,12 +20,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Scrollbar, ScrollbarState, Wrap},
     Frame, Terminal,
 };
-use crossterm::{
-    event::{self, KeyCode, KeyEventKind},
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
-    ExecutableCommand,
-};
 use std::io::stdout;
+use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
     enable_raw_mode()?;
@@ -45,61 +48,94 @@ fn main() -> anyhow::Result<()> {
     }
 
     while !app.should_quit {
-        terminal.draw(|f| ui(f, &mut app))?;  // 注意：ui 需要 mutable 引用
+        app.poll_search();
+        terminal.draw(|f| ui(f, &mut app))?; // 注意：ui 需要 mutable 引用
 
-        if let event::Event::Key(key) = event::read()? {
-            if key.kind == KeyEventKind::Press {
-                match key.code {
-                    KeyCode::Char('q') => app.should_quit = true,
-
-                    // 焦点切换
-                    KeyCode::Tab => app.toggle_focus(),
-
-                    // 左右方向键也可切换焦点
-                    KeyCode::Left => { app.focus = Focus::Left; }
-                    KeyCode::Right => { app.focus = Focus::Right; }
-
-                    // 上下键 / j/k 根据焦点执行不同操作
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if app.focus == Focus::Left {
-                            app.files.previous();
-                        } else {
-                            app.scroll(-1);
+        if event::poll(Duration::from_millis(100))? {
+            if let event::Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    if app.search_mode == SearchMode::Input {
+                        match key.code {
+                            KeyCode::Esc => app.close_search(),
+                            KeyCode::Enter => app.submit_search(),
+                            KeyCode::Backspace => app.pop_search_char(),
+                            KeyCode::Char(character) => app.push_search_char(character),
+                            _ => {}
                         }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if app.focus == Focus::Left {
-                            app.files.next();
-                        } else {
-                            app.scroll(1);
-                        }
+                        continue;
                     }
 
-                    KeyCode::PageDown => {
-                        if app.focus == Focus::Left {
-                            // 文件列表翻页（例如一次跳转 10 个）
-                            for _ in 0..10 {
-                                app.files.next();
-                            }
-                        } else {
-                            // 右侧滚动半屏（例如 10 行，或动态计算）
-                            app.scroll(10);  // 向下滚动 10 行
+                    match key.code {
+                        KeyCode::Char('q') => app.should_quit = true,
+                        KeyCode::Char('/') => app.begin_search_input(),
+                        KeyCode::Esc if app.search_is_visible() => app.close_search(),
+
+                        // 焦点切换
+                        KeyCode::Tab => app.toggle_focus(),
+
+                        // 左右方向键也可切换焦点
+                        KeyCode::Left => {
+                            app.focus = Focus::Left;
                         }
-                    }
-                    KeyCode::PageUp => {
-                        if app.focus == Focus::Left {
-                            for _ in 0..10 {
+                        KeyCode::Right => {
+                            app.focus = Focus::Right;
+                        }
+
+                        // 上下键 / j/k 根据焦点执行不同操作
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if app.search_mode == SearchMode::Results && app.focus == Focus::Left {
+                                app.previous_search_result();
+                            } else if app.focus == Focus::Left {
                                 app.files.previous();
+                            } else {
+                                app.scroll(-1);
                             }
-                        } else {
-                            app.scroll(-10);
                         }
-                    }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if app.search_mode == SearchMode::Results && app.focus == Focus::Left {
+                                app.next_search_result();
+                            } else if app.focus == Focus::Left {
+                                app.files.next();
+                            } else {
+                                app.scroll(1);
+                            }
+                        }
 
-                    // Enter: 左侧焦点时，目录则进入，文件则加载
-                    KeyCode::Enter => {
-                        if app.focus == Focus::Left {
-                            if app.files.is_selected_dir() {
+                        KeyCode::PageDown => {
+                            if app.focus == Focus::Left {
+                                for _ in 0..10 {
+                                    if app.search_mode == SearchMode::Results {
+                                        app.next_search_result();
+                                    } else {
+                                        app.files.next();
+                                    }
+                                }
+                            } else {
+                                // 右侧滚动半屏（例如 10 行，或动态计算）
+                                app.scroll(10); // 向下滚动 10 行
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            if app.focus == Focus::Left {
+                                for _ in 0..10 {
+                                    if app.search_mode == SearchMode::Results {
+                                        app.previous_search_result();
+                                    } else {
+                                        app.files.previous();
+                                    }
+                                }
+                            } else {
+                                app.scroll(-10);
+                            }
+                        }
+
+                        // Enter: 左侧焦点时，目录则进入，文件则加载
+                        KeyCode::Enter if app.focus == Focus::Left => {
+                            if app.search_mode == SearchMode::Results {
+                                if let Err(e) = app.load_selected_search_result() {
+                                    eprintln!("加载失败: {}", e);
+                                }
+                            } else if app.files.is_selected_dir() {
                                 app.enter_selected_dir();
                             } else {
                                 if let Err(e) = app.load_selected() {
@@ -107,16 +143,17 @@ fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
-                    }
 
-                    // Backspace: 左侧焦点时，返回上一级目录
-                    KeyCode::Backspace => {
-                        if app.focus == Focus::Left {
+                        // Backspace: 左侧焦点时，返回上一级目录
+                        KeyCode::Backspace
+                            if app.focus == Focus::Left
+                                && app.search_mode == SearchMode::Browsing =>
+                        {
                             app.go_parent();
                         }
-                    }
 
-                    _ => {}
+                        _ => {}
+                    }
                 }
             }
         }
@@ -129,48 +166,82 @@ fn main() -> anyhow::Result<()> {
 
 fn ui(f: &mut Frame, app: &mut App) {
     let main_chunks = Layout::default()
-    .direction(Direction::Vertical)
-    .constraints([Constraint::Min(0), Constraint::Length(3)])
-    .split(f.size());
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(0), Constraint::Length(3)])
+        .split(f.size());
 
     // 上部分再分为左右
     let chunks = Layout::default()
-    .direction(Direction::Horizontal)
-    .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-    .split(main_chunks[0]);
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .split(main_chunks[0]);
 
     // 左侧文件列表
-    let dir_name = app.files.current_dir
+    let dir_name = app
+        .files
+        .current_dir
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| app.files.current_dir.to_string_lossy().to_string());
-    let title = format!("Files [{}]", dir_name);
+    let title = match app.search_mode {
+        SearchMode::Input => format!("Search: {}█", app.search_query),
+        SearchMode::Searching => format!("Searching: {}", app.search_query),
+        SearchMode::Results => format!(
+            "Search: {} ({} results)",
+            app.search_query,
+            app.search_results.len()
+        ),
+        SearchMode::Browsing => format!("Files [{}]", dir_name),
+    };
 
-    let items: Vec<ListItem> = if app.files.entries.is_empty() {
+    let items: Vec<ListItem> = if app.search_mode == SearchMode::Searching {
+        vec![ListItem::new("正在搜索 Codex 与 Claude 历史记录...")]
+    } else if app.search_mode == SearchMode::Input {
+        vec![ListItem::new("输入关键词后按 Enter 搜索")]
+    } else if app.search_mode == SearchMode::Results {
+        if app.search_results.is_empty() {
+            vec![ListItem::new(format!(
+                "未找到匹配项（扫描 {} 个文件）",
+                app.search_scanned_files
+            ))]
+        } else {
+            app.search_results
+                .iter()
+                .map(|result| {
+                    ListItem::new(format!(
+                        "[{}] {}  · {}处命中\n  {}",
+                        result.source.label(),
+                        truncate_str(&result.title, 44),
+                        result.match_count,
+                        truncate_str(&result.snippet, 52)
+                    ))
+                })
+                .collect()
+        }
+    } else if app.files.entries.is_empty() {
         vec![ListItem::new("(empty)")]
     } else {
-        app.files.entries
+        app.files
+            .entries
             .iter()
-            .map(|entry| {
-                match entry {
-                    Entry::Parent => ListItem::new("📁 .."),
-                    Entry::Directory(p) => {
-                        let name = p.file_name().unwrap_or_default().to_string_lossy();
-                        ListItem::new(format!("📁 {}/", name))
-                    }
-                    Entry::File(p) => {
-                        let title = app
-                            .files
-                            .file_title(p)
-                            .map(|s| truncate_str(s, 50))
-                            .unwrap_or_else(|| {
-                                p.file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .to_string()
-                            });
-                        ListItem::new(format!("📄 {}", title))
-                    }
+            .map(|entry| match entry {
+                Entry::Parent => ListItem::new("📁 .."),
+                Entry::Directory(p) => {
+                    let name = p.file_name().unwrap_or_default().to_string_lossy();
+                    ListItem::new(format!("📁 {}/", name))
+                }
+                Entry::File(p) => {
+                    let title = app
+                        .files
+                        .file_title(p)
+                        .map(|s| truncate_str(s, 50))
+                        .unwrap_or_else(|| {
+                            p.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .to_string()
+                        });
+                    ListItem::new(format!("📄 {}", title))
                 }
             })
             .collect()
@@ -179,7 +250,10 @@ fn ui(f: &mut Frame, app: &mut App) {
     let (list_border_style, list_highlight) = if app.focus == Focus::Left {
         (Style::new().fg(Color::Cyan), Style::new().fg(Color::Yellow))
     } else {
-        (Style::new().fg(Color::DarkGray), Style::new().fg(Color::Rgb(80, 80, 0)))
+        (
+            Style::new().fg(Color::DarkGray),
+            Style::new().fg(Color::Rgb(80, 80, 0)),
+        )
     };
 
     let list = List::new(items)
@@ -191,7 +265,9 @@ fn ui(f: &mut Frame, app: &mut App) {
         )
         .highlight_style(list_highlight);
     let mut state = ratatui::widgets::ListState::default();
-    if !app.files.entries.is_empty() {
+    if app.search_mode == SearchMode::Results && !app.search_results.is_empty() {
+        state.select(Some(app.search_selected));
+    } else if app.search_mode == SearchMode::Browsing && !app.files.entries.is_empty() {
         state.select(Some(app.files.selected));
     }
     f.render_stateful_widget(list, chunks[0], &mut state);
@@ -244,7 +320,14 @@ fn ui(f: &mut Frame, app: &mut App) {
     }
 
     // ---- 底部帮助栏 ----
-    let help_text = " [Tab]切换焦点  [↑↓]移动  [PgUp/PgDn]翻页  [Enter]进入/加载  [Backspace]返回上级  [q]退出 ";
+    let help_text = match app.search_mode {
+        SearchMode::Input => " 输入关键词  [Enter]搜索  [Backspace]删除  [Esc]取消 ",
+        SearchMode::Searching => " 正在搜索 ~/.codex 与 ~/.claude  [Esc]返回浏览 ",
+        SearchMode::Results => " [↑↓]选择  [Enter]打开  [Tab]切换焦点  [/]重新搜索  [Esc]返回浏览 ",
+        SearchMode::Browsing => {
+            " [/]搜索  [Tab]切换焦点  [↑↓]移动  [Enter]进入/加载  [Backspace]返回  [q]退出 "
+        }
+    };
     let help_paragraph = Paragraph::new(help_text)
         .block(Block::default().borders(Borders::ALL).title("Help"))
         .alignment(ratatui::layout::Alignment::Center);

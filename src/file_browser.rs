@@ -1,5 +1,5 @@
-use std::path::PathBuf;
 use std::fs;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub enum Entry {
@@ -58,7 +58,7 @@ impl FileBrowser {
                 let path = entry.path();
                 if path.is_dir() {
                     dirs.push(path);
-                } else if path.extension().map_or(false, |ext| ext == "jsonl") {
+                } else if path.extension().is_some_and(|ext| ext == "jsonl") {
                     files.push(path);
                 }
             }
@@ -69,13 +69,21 @@ impl FileBrowser {
             a.file_name()
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_lowercase())
-                .cmp(&b.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()))
+                .cmp(
+                    &b.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_lowercase()),
+                )
         });
         files.sort_by(|a, b| {
             a.file_name()
                 .and_then(|n| n.to_str())
                 .map(|s| s.to_lowercase())
-                .cmp(&b.file_name().and_then(|n| n.to_str()).map(|s| s.to_lowercase()))
+                .cmp(
+                    &b.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_lowercase()),
+                )
         });
 
         for d in dirs {
@@ -115,7 +123,7 @@ impl FileBrowser {
     }
 
     pub fn is_selected_dir(&self) -> bool {
-        self.selected_entry().map_or(false, |e| e.is_dir())
+        self.selected_entry().is_some_and(|e| e.is_dir())
     }
 
     pub fn file_title(&self, path: &PathBuf) -> Option<&str> {

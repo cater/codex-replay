@@ -13,6 +13,11 @@ pub struct Message {
     pub timestamp: Option<DateTime<Utc>>,
 }
 
+pub struct ParsedSession {
+    pub title: Option<String>,
+    pub messages: Vec<Message>,
+}
+
 /// 判断一条消息是否为系统注入内容（权限指令、协作模式、技能列表、AGENTS.md 等）
 pub fn is_system_message(content: &str) -> bool {
     content.contains("<INSTRUCTIONS>")
@@ -29,21 +34,40 @@ pub fn is_system_message(content: &str) -> bool {
 /// 1. **Codex 格式** — `type: "response_item"` + `payload.type: "message"`
 /// 2. **Claude 格式** — `type: "user"` / `"assistant"` (Claude Code session)
 pub fn parse_jsonl_file(path: &Path) -> Result<Vec<Message>> {
+    Ok(parse_session_file(path)?.messages)
+}
+
+/// 单次读取会话文件，同时提取标题与消息。
+pub fn parse_session_file(path: &Path) -> Result<ParsedSession> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let mut messages = Vec::new();
+    let mut ai_title: Option<String> = None;
+    let mut first_user_prompt: Option<String> = None;
 
     for line in reader.lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let obj: Value = serde_json::from_str(&line)?;
+        let obj: Value = match serde_json::from_str(&line) {
+            Ok(obj) => obj,
+            Err(_) => continue,
+        };
 
         match obj.get("type").and_then(|v| v.as_str()) {
+            Some("ai-title") if ai_title.is_none() => {
+                ai_title = obj
+                    .get("aiTitle")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_string);
+            }
             // ── Codex 格式 ──────────────────────────────
             Some("response_item") => {
                 if let Some(msg) = parse_codex_message(&obj) {
+                    remember_first_user_prompt(&mut first_user_prompt, &msg);
                     messages.push(msg);
                 }
             }
@@ -51,6 +75,7 @@ pub fn parse_jsonl_file(path: &Path) -> Result<Vec<Message>> {
             // ── Claude 格式 ─────────────────────────────
             Some("user") => {
                 if let Some(msg) = parse_claude_user_message(&obj) {
+                    remember_first_user_prompt(&mut first_user_prompt, &msg);
                     messages.push(msg);
                 }
             }
@@ -65,7 +90,10 @@ pub fn parse_jsonl_file(path: &Path) -> Result<Vec<Message>> {
             _ => {}
         }
     }
-    Ok(messages)
+    Ok(ParsedSession {
+        title: ai_title.or(first_user_prompt),
+        messages,
+    })
 }
 
 /// 提取会话标题。
@@ -74,49 +102,17 @@ pub fn parse_jsonl_file(path: &Path) -> Result<Vec<Message>> {
 /// 1. Claude/Codex 日志中的 `ai-title`
 /// 2. 第一条真实用户消息
 pub fn extract_session_title(path: &Path) -> Result<Option<String>> {
-    let file = File::open(path)?;
-    let reader = BufReader::new(file);
-    let mut first_user_prompt: Option<String> = None;
+    Ok(parse_session_file(path)?.title)
+}
 
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let obj: Value = match serde_json::from_str(&line) {
-            Ok(obj) => obj,
-            Err(_) => continue,
-        };
-
-        match obj.get("type").and_then(|v| v.as_str()) {
-            Some("ai-title") => {
-                if let Some(title) = obj.get("aiTitle").and_then(|v| v.as_str()) {
-                    let title = title.trim();
-                    if !title.is_empty() {
-                        return Ok(Some(title.to_string()));
-                    }
-                }
-            }
-            Some("user") if first_user_prompt.is_none() => {
-                if let Some(msg) = parse_claude_user_message(&obj) {
-                    if !is_system_message(&msg.content) {
-                        first_user_prompt = Some(first_line(&msg.content));
-                    }
-                }
-            }
-            Some("response_item") if first_user_prompt.is_none() => {
-                if let Some(msg) = parse_codex_message(&obj) {
-                    if msg.role == "user" && !is_system_message(&msg.content) {
-                        first_user_prompt = Some(first_line(&msg.content));
-                    }
-                }
-            }
-            _ => {}
+fn remember_first_user_prompt(first_user_prompt: &mut Option<String>, message: &Message) {
+    if first_user_prompt.is_none() && message.role == "user" && !is_system_message(&message.content)
+    {
+        let prompt = first_line(&message.content);
+        if !prompt.is_empty() {
+            *first_user_prompt = Some(prompt);
         }
     }
-
-    Ok(first_user_prompt.filter(|s| !s.is_empty()))
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -274,10 +270,7 @@ fn parse_claude_assistant_message(obj: &Value) -> Option<Message> {
                     .get("name")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
-                let tool_id = block
-                    .get("id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?");
+                let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("?");
 
                 let args_str = block
                     .get("input")
@@ -522,7 +515,10 @@ mod tests {
         let title = extract_session_title(&path).unwrap();
         let _ = std::fs::remove_file(&path);
 
-        assert_eq!(title.as_deref(), Some("Add directory navigation to file browser"));
+        assert_eq!(
+            title.as_deref(),
+            Some("Add directory navigation to file browser")
+        );
     }
 
     #[test]

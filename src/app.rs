@@ -1,7 +1,9 @@
 use crate::conversation::Conversation;
-use crate::file_browser::FileBrowser;
+use crate::file_browser::{FileBrowser, FileStamp};
+use crate::parser::Message;
 use crate::search::{default_search_roots, search_history, SearchReport, SearchResult};
 use ratatui::text::Text;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver};
 
@@ -34,6 +36,7 @@ pub struct App {
     pub search_scanned_files: usize,
     pub search_errors: Vec<String>,
     search_receiver: Option<Receiver<SearchReport>>,
+    session_cache: HashMap<std::path::PathBuf, (FileStamp, Vec<Message>)>,
 }
 
 impl App {
@@ -53,6 +56,7 @@ impl App {
             search_scanned_files: 0,
             search_errors: Vec::new(),
             search_receiver: None,
+            session_cache: HashMap::new(),
         }
     }
 
@@ -76,12 +80,33 @@ impl App {
     }
 
     fn load_path(&mut self, path: &Path) -> anyhow::Result<()> {
-        let messages = crate::parser::parse_jsonl_file(path)?;
+        let messages = self.load_messages(path)?;
         self.conversation.set_messages(messages);
         self.rendered_text = self.conversation.render();
         self.total_lines = self.rendered_text.height();
         self.scroll_offset = 0;
         Ok(())
+    }
+
+    /// 加载会话消息，命中缓存（mtime/size 未变）时直接复用
+    fn load_messages(&mut self, path: &Path) -> anyhow::Result<Vec<Message>> {
+        let owned_path = path.to_path_buf();
+        if let Some(stamp) = FileStamp::from_path(&owned_path) {
+            if let Some((cached_stamp, cached)) = self.session_cache.get(&owned_path) {
+                if *cached_stamp == stamp {
+                    return Ok(cached.clone());
+                }
+            }
+        }
+
+        let messages = crate::parser::parse_jsonl_file(path)?;
+        if let Some(stamp) = FileStamp::from_path(&owned_path) {
+            if self.session_cache.len() >= 64 {
+                self.session_cache.clear();
+            }
+            self.session_cache.insert(owned_path, (stamp, messages.clone()));
+        }
+        Ok(messages)
     }
 
     pub fn begin_search_input(&mut self) {

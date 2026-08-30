@@ -105,6 +105,74 @@ pub fn extract_session_title(path: &Path) -> Result<Option<String>> {
     Ok(parse_session_file(path)?.title)
 }
 
+/// 目录列表专用的轻量标题提取（比 [`extract_session_title`] 快）。
+///
+/// - 只对前 [`TITLE_PARSE_LIMIT`] 行做 JSON 解析（标题信息通常出现在文件开头几十行内）；
+/// - 其余行仅做 `"ai-title"` 子串扫描（无解析），确保出现在文件后部的 ai-title 也能取到；
+/// - 找到有效 ai-title 立即停止读取；
+/// - 解析预算内两者都没找到时，回退全量解析保证正确性。
+pub fn extract_session_title_fast(path: &Path) -> Result<Option<String>> {
+    const TITLE_PARSE_LIMIT: usize = 128;
+
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut ai_title: Option<String> = None;
+    let mut first_user_prompt: Option<String> = None;
+    let mut parse_budget = TITLE_PARSE_LIMIT;
+
+    loop {
+        let mut line = String::new();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // 廉价的 ai-title 探测：命中才解析该行
+        if ai_title.is_none() && line.contains("ai-title") {
+            if let Ok(obj) = serde_json::from_str::<Value>(line) {
+                if obj.get("type").and_then(|v| v.as_str()) == Some("ai-title") {
+                    ai_title = obj
+                        .get("aiTitle")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string);
+                }
+            }
+            if ai_title.is_some() {
+                break;
+            }
+        }
+
+        if parse_budget > 0 {
+            parse_budget -= 1;
+            if let Ok(obj) = serde_json::from_str::<Value>(line) {
+                match obj.get("type").and_then(|v| v.as_str()) {
+                    Some("response_item") => {
+                        if let Some(msg) = parse_codex_message(&obj) {
+                            remember_first_user_prompt(&mut first_user_prompt, &msg);
+                        }
+                    }
+                    Some("user") => {
+                        if let Some(msg) = parse_claude_user_message(&obj) {
+                            remember_first_user_prompt(&mut first_user_prompt, &msg);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(title) = ai_title.or(first_user_prompt) {
+        return Ok(Some(title));
+    }
+    extract_session_title(path)
+}
+
 fn remember_first_user_prompt(first_user_prompt: &mut Option<String>, message: &Message) {
     if first_user_prompt.is_none() && message.role == "user" && !is_system_message(&message.content)
     {
@@ -532,6 +600,105 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(title.as_deref(), Some("first prompt"));
+    }
+
+    // ── 快速标题提取测试 ───────────────────────────────────
+
+    #[test]
+    fn test_fast_title_prefers_ai_title_found_after_user_prompt() {
+        let jsonl = r#"
+{"type":"user","message":{"role":"user","content":"real prompt"},"isMeta":false}
+{"type":"ai-title","aiTitle":"AI Generated Title"}
+"#;
+        let path = temp_jsonl("fast_title_ai_after_prompt", jsonl);
+        let title = extract_session_title_fast(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title.as_deref(), Some("AI Generated Title"));
+    }
+
+    #[test]
+    fn test_fast_title_falls_back_to_user_prompt() {
+        let jsonl = r#"
+{"type":"mode","mode":"normal","sessionId":"abc"}
+{"type":"user","message":{"role":"user","content":"first prompt"},"isMeta":false}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}
+"#;
+        let path = temp_jsonl("fast_title_user_prompt", jsonl);
+        let title = extract_session_title_fast(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title.as_deref(), Some("first prompt"));
+    }
+
+    #[test]
+    fn test_fast_title_finds_ai_title_beyond_parse_limit() {
+        // ai-title 出现在解析预算（128 行）之后，仍应通过子串扫描取到
+        let filler = vec![
+            r#"{"type":"mode","mode":"normal","sessionId":"abc"}"#;
+            200
+        ]
+        .join("\n");
+        let jsonl = format!(
+            "{}\n{{\"type\":\"ai-title\",\"aiTitle\":\"Late Title\"}}",
+            filler
+        );
+        let path = temp_jsonl("fast_title_late_ai_title", &jsonl);
+        let title = extract_session_title_fast(&path).unwrap();
+        let expected = extract_session_title(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title.as_deref(), Some("Late Title"));
+        assert_eq!(title, expected);
+    }
+
+    #[test]
+    fn test_fast_title_falls_back_to_full_parse_for_late_user_prompt() {
+        // 首条用户消息在解析预算之后且无 ai-title，回退全量解析保证正确性
+        let filler = vec![
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}"#;
+            200
+        ]
+        .join("\n");
+        let jsonl = format!(
+            "{}\n{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"late prompt\"}},\"isMeta\":false}}",
+            filler
+        );
+        let path = temp_jsonl("fast_title_late_prompt", &jsonl);
+        let title = extract_session_title_fast(&path).unwrap();
+        let expected = extract_session_title(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title.as_deref(), Some("late prompt"));
+        assert_eq!(title, expected);
+    }
+
+    #[test]
+    fn test_fast_title_none_when_no_title() {
+        let jsonl = r#"{"type":"mode","mode":"normal","sessionId":"abc"}"#;
+        let path = temp_jsonl("fast_title_none", jsonl);
+        let title = extract_session_title_fast(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(title, None);
+    }
+
+    #[test]
+    fn test_fast_title_matches_full_parse_on_real_files() {
+        // 用仓库根目录的真实会话日志验证快速路径与全量解析一致
+        for name in [
+            "5e11285d-8365-42e9-a672-7d20f219facf.jsonl",
+            "c21b0853-5bb8-468d-94ce-3094f465d280.jsonl",
+        ] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            if !path.exists() {
+                continue;
+            }
+            let fast = extract_session_title_fast(&path).unwrap();
+            let full = extract_session_title(&path).unwrap();
+            assert_eq!(fast, full, "mismatch for {}", name);
+            assert!(fast.is_some(), "expected title in {}", name);
+        }
     }
 
     #[test]
